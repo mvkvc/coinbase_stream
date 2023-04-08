@@ -4055,6 +4055,22 @@ files = [
 ]
 
 [[package]]
+name = "slack-sdk"
+version = "3.21.0"
+description = "The Slack API Platform SDK for Python"
+category = "main"
+optional = false
+python-versions = ">=3.6.0"
+files = [
+    {file = "slack_sdk-3.21.0-py2.py3-none-any.whl", hash = "sha256:c5452d0bfa8cb716103522e51f695efac8d62af20d95e419b8c3265525941405"},
+    {file = "slack_sdk-3.21.0.tar.gz", hash = "sha256:552c6961293da524def64e012543bc4b8859f96fa8780f016de6daf8abeb1c1c"},
+]
+
+[package.extras]
+optional = ["SQLAlchemy (>=1.4,<3)", "aiodns (>1.0)", "aiohttp (>=3.7.3,<4)", "boto3 (<=2)", "websocket-client (>=1,<2)", "websockets (>=10,<11)"]
+testing = ["Flask (>=1,<2)", "Flask-Sockets (>=0.2,<1)", "Jinja2 (==3.0.3)", "Werkzeug (<2)", "black (==22.8.0)", "boto3 (<=2)", "click (==8.0.4)", "codecov (>=2,<3)", "databases (>=0.5)", "flake8 (>=5,<6)", "itsdangerous (==1.1.0)", "moto (>=3,<4)", "psutil (>=5,<6)", "pytest (>=6.2.5,<7)", "pytest-asyncio (<1)", "pytest-cov (>=2,<3)"]
+
+[[package]]
 name = "sniffio"
 version = "1.3.0"
 description = "Sniff out which async library your code is running under"
@@ -4929,4 +4945,4 @@ test = ["mypy", "pre-commit", "pytest", "pytest-asyncio", "websockets (>=10.0)"]
 [metadata]
 lock-version = "2.0"
 python-versions = "~3.10"
-content-hash = "f3322f540f635d73ccd7f995a6277658606d3f481b2003b6ce00f49bb78d8bca"
+content-hash = "fcc4c3d7c910b4874626dca0233506a657ed542f807f7d4a7d4bc8463ab99872"

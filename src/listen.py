@@ -3,6 +3,9 @@ from datetime import datetime
 import json
 import os
 import warnings
+import atexit
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 from azure.storage.blob.aio import BlobServiceClient
 import click
@@ -15,6 +18,14 @@ import websockets
 
 message_count = [0]
 batch_count = [0]
+
+
+def send_slack_message(client, channel, text):
+    try:
+        response = client.chat_postMessage(channel=channel, text=text)
+        print(f"Slack message sent: {response}")
+    except SlackApiError as e:
+        print("Error sending Slack message:", e)
 
 
 async def status_message(count):
@@ -46,14 +57,15 @@ def write_batch(batch, fname, path_data, pa_schema, pd_columns, pd_dtypes):
     pq.write_table(table, f"{abs_path}/{fname}")
 
 
-async def upload_batch(container_client, fname, path_data):
+async def upload_batch(blob_client, fname, path_data):
     try:
-        blob_client = container_client.get_blob_client(fname)
-
         with open(f"{path_data}/{fname}", "rb") as data:
+            print(f"Uploading {fname}")
             await blob_client.upload_blob(data, overwrite=True)
 
-        print(f"Uploaded {fname}")
+        data.close()
+        print(f"Deleting {fname}")
+        os.remove(f"{path_data}/{fname}")
     except Exception as e:
         print(f"Error uploading {fname}: {e}")
 
@@ -111,7 +123,7 @@ def create_book(ob_dict, message):
 
 async def handle_messages(
     url,
-    container_client,
+    blob_client,
     path_data,
     subscribe_message,
     batch_size,
@@ -119,7 +131,6 @@ async def handle_messages(
     pa_schema,
     pd_columns,
     pd_dtypes,
-    upload,
 ):
     async with websockets.connect(url) as websocket:
         await websocket.send(json.dumps(subscribe_message))
@@ -145,11 +156,16 @@ async def handle_messages(
                     if batch_count[0] >= batch_size:
                         fname = get_fname()
                         write_batch(
-                            batch, fname, path_data, pa_schema, pd_columns, pd_dtypes
+                            batch,
+                            fname,
+                            path_data,
+                            pa_schema,
+                            pd_columns,
+                            pd_dtypes,
                         )
 
-                        if upload:
-                            await upload_batch(container_client, fname, path_data)
+                        if blob_client:
+                            await upload_batch(blob_client, fname, path_data)
 
                         batch = []
                         batch_count[0] = 0
@@ -169,11 +185,14 @@ async def handle_messages(
 @click.option("--batch-size", show_default=True, default=10_000)
 @click.option("--price-levels", show_default=True, default=10)
 @click.option("--upload", is_flag=True, show_default=True, default=False)
-def main(ws_url, product_ids, path_data, batch_size, price_levels, upload):
+@click.option("--slack", is_flag=True, show_default=True, default=False)
+def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack):
     """
     Connects to the Coinbase websocket API to receive real-time market data, and writes the top N price level prices and amounts to Parquet files.
 
-    Optionally, the Parquet file can be uploaded to Azure Blob Storage using the `--upload` flag which also deletes the file after upload. The following environment variables must be set in the local .env file: AZURE_URL, AZURE_ACCESS_KEY, and AZURE_BLOB_CONTAINER.
+    The `--upload` flag enables uploading the Parquet file to Azure Blob Storage and deleting the file after upload. The following environment variables must be set in the local `.env` file: AZURE_URL, AZURE_ACCESS_KEY, and AZURE_BLOB_CONTAINER.
+
+    The `--slack` flag will send a message to a provided Slack channel when the script is exiting. The following environment variables must be set in the local `.env` file: SLACK_TOKEN, SLACK_CHANNEL.
     """
 
     product_ids = product_ids.split(",")
@@ -214,25 +233,47 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload):
 
     load_dotenv()
 
-    for env_var in ["AZURE_URL", "AZURE_ACCESS_KEY", "AZURE_BLOB_CONTAINER"]:
-        if env_var not in os.environ:
-            raise ValueError(f"Missing environment variable: {env_var}")
+    container_client = None
+    if upload:
+        for env_var in ["AZURE_URL", "AZURE_ACCESS_KEY", "AZURE_BLOB_CONTAINER"]:
+            if env_var not in os.environ:
+                raise ValueError(f"Missing environment variable: {env_var}")
 
-    azure_url = os.environ.get("AZURE_URL")
-    azure_access_key = os.getenv("AZURE_ACCESS_KEY")
-    blob_container = os.environ.get("AZURE_BLOB_CONTAINER")
+        azure_url = os.environ.get("AZURE_URL")
+        azure_access_key = os.getenv("AZURE_ACCESS_KEY")
+        blob_container = os.environ.get("AZURE_BLOB_CONTAINER")
 
-    path_data = os.path.abspath(path_data)
-    blob_service_client = BlobServiceClient(azure_url, credential=azure_access_key)
-    container_client = blob_service_client.get_container_client(blob_container)
+        path_data = os.path.abspath(path_data)
+        blob_service_client = BlobServiceClient(azure_url, credential=azure_access_key)
+        container_client = blob_service_client.get_container_client(blob_container)
+        blob_client = container_client.get_blob_client(blob_container)
 
+    if slack:
+        for env_var in ["SLACK_TOKEN", "SLACK_CHANNEL"]:
+            if env_var not in os.environ:
+                raise ValueError(f"Missing environment variable: {env_var}")
+
+        slack_token = os.environ.get("SLACK_TOKEN")
+        slack_channel = os.environ.get("SLACK_CHANNEL")
+
+        # Create a WebClient instance
+        client = WebClient(token=slack_token)
+
+        def send_exit_message():
+            print("Sending exit message to Slack")
+            send_slack_message(
+                client, slack_channel, "Exiting Coinbase websocket script"
+            )
+
+        atexit.register(send_exit_message)
     warnings.filterwarnings("ignore", category=DeprecationWarning)
 
     try:
+        # Start the handle messages coroutine
         asyncio.run(
             handle_messages(
                 ws_url,
-                container_client,
+                blob_client,
                 path_data,
                 subscribe_message,
                 batch_size,
@@ -240,7 +281,6 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload):
                 pa_schema,
                 pd_columns,
                 pd_dtypes,
-                upload,
             )
         )
     except Exception as e:
