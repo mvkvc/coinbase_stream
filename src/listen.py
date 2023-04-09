@@ -1,11 +1,9 @@
 import asyncio
+import atexit
 from datetime import datetime
+from itertools import islice
 import json
 import os
-import warnings
-import atexit
-from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 
 from azure.storage.blob.aio import BlobServiceClient
 import click
@@ -13,8 +11,13 @@ from dotenv import load_dotenv
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from sortedcollections import SortedDict
 import websockets
+
+# TODO: Remove global variables if possible
+# TODO: Use pyarrow record batch writer instead of dataframe (input is list of column lists)
 
 message_count = [0]
 batch_count = [0]
@@ -23,19 +26,19 @@ batch_count = [0]
 def send_slack_message(client, channel, text):
     try:
         response = client.chat_postMessage(channel=channel, text=text)
-        print(f"Slack message sent: {response}")
+        print(f"Slack message sent: {response['message']['text']}")
     except SlackApiError as e:
         print("Error sending Slack message:", e)
 
 
-async def status_message(count):
+async def status_message(message_count, batch_count):
     while True:
-        message_count = count[0]
+        messages_initial = message_count[0]
         await asyncio.sleep(1)
-        messages_received = count[0] - message_count
+        messages_received = message_count[0] - messages_initial
         batch_size = batch_count[0]
         print(f"messages/s: {messages_received}, batch_size: {batch_size}")
-        count[0] = 0
+        message_count[0] = 0
 
 
 def get_fname():
@@ -45,99 +48,89 @@ def get_fname():
     return f"coinbase_stream_{ts}.parquet"
 
 
-def write_batch(batch, fname, path_data, pa_schema, pd_columns, pd_dtypes):
-    print(f"Writing batch to {fname}")
-
+def write_batch(batch, fname, path_data, pa_schema, pd_columns):
     df = pd.DataFrame(batch, columns=pd_columns)
-    df["ts"] = pd.to_datetime(df["ts"], utc=True).dt.tz_localize(None)
-    df = df.astype(pd_dtypes)
+    df["ts"] = pd.to_datetime(df["ts"], utc=False)
 
     table = pa.Table.from_pandas(df, schema=pa_schema)
     abs_path = os.path.abspath(path_data)
+
+    print(f"Writing batch to {fname}")
     pq.write_table(table, f"{abs_path}/{fname}")
 
 
-async def upload_batch(blob_client, fname, path_data):
-    try:
-        with open(f"{path_data}/{fname}", "rb") as data:
-            print(f"Uploading {fname}")
-            await blob_client.upload_blob(data, overwrite=True)
+async def upload_batch(container_client, fname, path_data):
+    blob_client = container_client.get_blob_client(fname)
 
-        data.close()
-        print(f"Deleting {fname}")
-        os.remove(f"{path_data}/{fname}")
-    except Exception as e:
-        print(f"Error uploading {fname}: {e}")
+    with open(f"{path_data}/{fname}", "rb") as data:
+        print(f"Uploading {fname}")
+        await blob_client.upload_blob(data, overwrite=True)
 
 
-def process_message(message, order_book, price_levels):
+def process_message(message, order_book, side_map, price_levels):
     ts = message["time"]
     product_id = message["product_id"]
     side = message["changes"][0][0]
     price = float(message["changes"][0][1])
     amount = float(message["changes"][0][2])
 
-    order_book = update_book(order_book, product_id, side, price, amount)
-    top_n = top_n_order_book(order_book, product_id, price_levels)
+    book = book_update(order_book, side_map, product_id, side, price, amount)
+    top_n = book_top_n(order_book, product_id, price_levels)
 
-    return order_book, [ts, product_id] + top_n
-
-
-def top_n_order_book(ob_dict, id, n):
-    ask_prices = list(ob_dict[id]["asks"].keys())[:n]
-    ask_volumes = list(ob_dict[id]["asks"].values())[:n]
-    bid_prices = list(ob_dict[id]["bids"].keys())[-n:]
-    bid_volumes = list(ob_dict[id]["bids"].values())[-n:]
-
-    return ask_prices + ask_volumes + bid_prices + bid_volumes
+    return book, [ts, product_id] + top_n
 
 
-def update_book(ob_dict, id, side, price, amount):
-    if side == "sell":
-        side = "asks"
-    elif side == "buy":
-        side = "bids"
+def book_top_n(ob_dict, id, n):
+    asks = ob_dict[id]["asks"]
+    bids = ob_dict[id]["bids"]
+
+    ask_prices, ask_volumes = zip(*islice(asks.items(), n))
+    bid_prices, bid_volumes = zip(*islice(reversed(bids.items()), n))
+
+    return list(ask_prices) + list(ask_volumes) + list(bid_prices) + list(bid_volumes)
+
+
+def book_update(book_dict, side_map, id, side, price, amount):
+    side = side_map.get(side)
 
     if amount == "0":
-        if price in ob_dict[id][side]:
-            del ob_dict[id][side][price]
+        book_dict[id][side].pop(price, None)
     else:
-        ob_dict[id][side][price] = amount
+        book_dict[id][side][price] = amount
 
-    return ob_dict
+    return book_dict
 
 
-def create_book(ob_dict, message):
+def create_book(book_dict, message):
     id = message["product_id"]
     asks = message["asks"]
     bids = message["bids"]
 
-    ob_dict[id] = {"asks": SortedDict(), "bids": SortedDict()}
-    for ask in asks:
-        ob_dict[id]["asks"][float(ask[0])] = float(ask[1])
-    for bid in bids:
-        ob_dict[id]["bids"][float(bid[0])] = float(bid[1])
+    book_dict[id] = {
+        "asks": SortedDict({float(ask[0]): float(ask[1]) for ask in asks}),
+        "bids": SortedDict({float(bid[0]): float(bid[1]) for bid in bids}),
+    }
 
-    return ob_dict
+    return book_dict
 
 
 async def handle_messages(
     url,
-    blob_client,
+    container_client,
     path_data,
     subscribe_message,
     batch_size,
     price_levels,
     pa_schema,
     pd_columns,
-    pd_dtypes,
 ):
-    async with websockets.connect(url) as websocket:
-        await websocket.send(json.dumps(subscribe_message))
-        status_task = asyncio.create_task(status_message(message_count))
+    side_map = {"buy": "bids", "sell": "asks"}
+    order_book = {}
+    batch = []
 
-        batch = []
-        order_book = {}
+    async with websockets.connect(url, ping_timeout=None) as websocket:
+        asyncio.create_task(status_message(message_count, batch_count))
+        await websocket.send(json.dumps(subscribe_message))
 
         try:
             while True:
@@ -147,7 +140,7 @@ async def handle_messages(
                 if "changes" in message.keys():
                     message_count[0] += 1
                     order_book, fmted_message = process_message(
-                        message, order_book, price_levels
+                        message, order_book, side_map, price_levels
                     )
 
                     batch.append(fmted_message)
@@ -155,35 +148,26 @@ async def handle_messages(
 
                     if batch_count[0] >= batch_size:
                         fname = get_fname()
-                        write_batch(
-                            batch,
-                            fname,
-                            path_data,
-                            pa_schema,
-                            pd_columns,
-                            pd_dtypes,
-                        )
+                        write_batch(batch, fname, path_data, pa_schema, pd_columns)
 
-                        if blob_client:
-                            await upload_batch(blob_client, fname, path_data)
+                        if container_client:
+                            await upload_batch(container_client, fname, path_data)
 
                         batch = []
                         batch_count[0] = 0
                 elif "asks" in message.keys():
+                    print(f"Creating book for: {message['product_id']}")
                     order_book = create_book(order_book, message)
-                    print(f"Book created for: {message['product_id']}")
-                else:
-                    pass
         except Exception as e:
-            print(f"Error in handling message: {e}")
+            print(f"Error handling message: {e}")
 
 
 @click.command()
 @click.option("--ws-url", show_default=True, default="wss://ws-feed.pro.coinbase.com")
-@click.option("--product-ids", show_default=True, default="BTC-USD,ETH-USD,ADA-USD")
+@click.option("--product-ids", show_default=True, default="BTC-USD,ETH-USD")
 @click.option("--path-data", show_default=True, default="data")
 @click.option("--batch-size", show_default=True, default=10_000)
-@click.option("--price-levels", show_default=True, default=10)
+@click.option("--price-levels", show_default=True, default=20)
 @click.option("--upload", is_flag=True, show_default=True, default=False)
 @click.option("--slack", is_flag=True, show_default=True, default=False)
 def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack):
@@ -196,13 +180,11 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack
     """
 
     product_ids = product_ids.split(",")
-
     subscribe_message = {
         "type": "subscribe",
         "product_ids": product_ids,
         "channels": ["level2"],
     }
-
     pd_columns = (
         ["ts", "product_id"]
         + [f"ask_price{i}" for i in range(1, price_levels + 1)]
@@ -210,15 +192,6 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack
         + [f"bid_price{i}" for i in range(1, price_levels + 1)]
         + [f"bid_volume{i}" for i in range(1, price_levels + 1)]
     )
-    pd_dtypes = {
-        "ts": "datetime64[ns]",
-        "product_id": "str",
-    }
-    pd_dtypes.update({f"ask_price{i}": "float64" for i in range(1, price_levels + 1)})
-    pd_dtypes.update({f"ask_volume{i}": "float64" for i in range(1, price_levels + 1)})
-    pd_dtypes.update({f"bid_price{i}": "float64" for i in range(1, price_levels + 1)})
-    pd_dtypes.update({f"bid_volume{i}": "float64" for i in range(1, price_levels + 1)})
-
     pa_fields = (
         [
             pa.field("ts", pa.timestamp("ns", tz="UTC")),
@@ -246,7 +219,6 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack
         path_data = os.path.abspath(path_data)
         blob_service_client = BlobServiceClient(azure_url, credential=azure_access_key)
         container_client = blob_service_client.get_container_client(blob_container)
-        blob_client = container_client.get_blob_client(blob_container)
 
     if slack:
         for env_var in ["SLACK_TOKEN", "SLACK_CHANNEL"]:
@@ -256,35 +228,27 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack
         slack_token = os.environ.get("SLACK_TOKEN")
         slack_channel = os.environ.get("SLACK_CHANNEL")
 
-        # Create a WebClient instance
         client = WebClient(token=slack_token)
 
         def send_exit_message():
-            print("Sending exit message to Slack")
             send_slack_message(
                 client, slack_channel, "Exiting Coinbase websocket script"
             )
 
         atexit.register(send_exit_message)
-    warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-    try:
-        # Start the handle messages coroutine
-        asyncio.run(
-            handle_messages(
-                ws_url,
-                blob_client,
-                path_data,
-                subscribe_message,
-                batch_size,
-                price_levels,
-                pa_schema,
-                pd_columns,
-                pd_dtypes,
-            )
+    asyncio.run(
+        handle_messages(
+            ws_url,
+            container_client,
+            path_data,
+            subscribe_message,
+            batch_size,
+            price_levels,
+            pa_schema,
+            pd_columns,
         )
-    except Exception as e:
-        print(f"Error in main: {e}")
+    )
 
 
 if __name__ == "__main__":

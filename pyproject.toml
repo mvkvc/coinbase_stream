@@ -10,18 +10,18 @@ python = "~3.10"
 python-dotenv = "^1.0.0"
 websockets = "^11.0"
 azure-storage-blob = "^12.15.0"
-azure-identity = "^1.12.0"
 pyarrow = "^11.0.0"
 pandas = "^2.0.0"
-apache-airflow = "^2.5.3"
 sortedcollections = "^2.1.0"
 click = "^8.1.3"
 slack-sdk = "^3.21.0"
+aiohttp = "^3.8.4"
 
 [tool.poetry.group.dev.dependencies]
+jupyterlab = "^3.6.3"
 black = "^23.3.0"
 isort = "^5.12.0"
-jupyterlab = "^3.6.3"
+scalene = "^1.5.20"
 
 [build-system]
 requires = ["poetry-core"]

@@ -4,6 +4,7 @@ pyrightconfig.json
 data/*
 !data/.keep
 .vscode
+profile.*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
