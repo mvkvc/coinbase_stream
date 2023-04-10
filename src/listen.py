@@ -16,8 +16,8 @@ from slack_sdk.errors import SlackApiError
 from sortedcollections import SortedDict
 import websockets
 
+# TODO: Add logging
 # TODO: Remove global variables if possible
-# TODO: Use pyarrow record batch writer instead of dataframe (input is list of column lists)
 
 message_count = [0]
 batch_count = [0]
@@ -49,12 +49,12 @@ def get_fname():
 
 
 def write_batch(batch, fname, path_data, pa_schema, pd_columns):
-    df = pd.DataFrame(batch, columns=pd_columns)
-    df["ts"] = pd.to_datetime(df["ts"], utc=False)
+    for index, value in enumerate(batch):
+        batch[index] = pa.array(value)
 
-    table = pa.Table.from_pandas(df, schema=pa_schema)
+    table = pa.Table.from_arrays(batch, schema=pa_schema)
+
     abs_path = os.path.abspath(path_data)
-
     print(f"Writing batch to {fname}")
     pq.write_table(table, f"{abs_path}/{fname}")
 
@@ -93,7 +93,7 @@ def book_top_n(ob_dict, id, n):
 def book_update(book_dict, side_map, id, side, price, amount):
     side = side_map.get(side)
 
-    if amount == "0":
+    if amount == 0:
         book_dict[id][side].pop(price, None)
     else:
         book_dict[id][side][price] = amount
@@ -114,6 +114,10 @@ def create_book(book_dict, message):
     return book_dict
 
 
+def reset_batch(price_levels):
+    return [[] for _ in range(price_levels * 4 + 2)]
+
+
 async def handle_messages(
     url,
     container_client,
@@ -123,10 +127,11 @@ async def handle_messages(
     price_levels,
     pa_schema,
     pd_columns,
+    delete,
 ):
     side_map = {"buy": "bids", "sell": "asks"}
     order_book = {}
-    batch = []
+    batch = reset_batch(price_levels)
 
     async with websockets.connect(url, ping_timeout=None) as websocket:
         asyncio.create_task(status_message(message_count, batch_count))
@@ -143,7 +148,10 @@ async def handle_messages(
                         message, order_book, side_map, price_levels
                     )
 
-                    batch.append(fmted_message)
+                    for b, m in zip(batch, fmted_message):
+                        b.append(m)
+
+                    # batch.append(fmted_message)
                     batch_count[0] += 1
 
                     if batch_count[0] >= batch_size:
@@ -152,8 +160,10 @@ async def handle_messages(
 
                         if container_client:
                             await upload_batch(container_client, fname, path_data)
+                            if delete:
+                                os.remove(f"{path_data}/{fname}")
 
-                        batch = []
+                        batch = reset_batch(price_levels)
                         batch_count[0] = 0
                 elif "asks" in message.keys():
                     print(f"Creating book for: {message['product_id']}")
@@ -163,18 +173,64 @@ async def handle_messages(
 
 
 @click.command()
-@click.option("--ws-url", show_default=True, default="wss://ws-feed.pro.coinbase.com")
-@click.option("--product-ids", show_default=True, default="BTC-USD,ETH-USD")
-@click.option("--path-data", show_default=True, default="data")
-@click.option("--batch-size", show_default=True, default=10_000)
-@click.option("--price-levels", show_default=True, default=20)
-@click.option("--upload", is_flag=True, show_default=True, default=False)
-@click.option("--slack", is_flag=True, show_default=True, default=False)
-def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack):
+@click.option(
+    "--ws-url",
+    show_default=True,
+    default="wss://ws-feed.pro.coinbase.com",
+    help="Websocket URL",
+)
+@click.option(
+    "--product-ids",
+    show_default=True,
+    default="BTC-USD,ETH-USD,ADA-USD",
+    help="Comma-separated list of product IDs",
+)
+@click.option(
+    "--path-data",
+    show_default=True,
+    default="data",
+    help="Relative path to write Parquet files",
+)
+@click.option(
+    "--batch-size",
+    show_default=True,
+    default=100_000,
+    help="Number of messages to write to Parquet file before uploading",
+)
+@click.option(
+    "--price-levels",
+    show_default=True,
+    default=20,
+    help="Number of price levels to write to Parquet file",
+)
+@click.option(
+    "--upload",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Upload Parquet files to Azure Blob Storage",
+)
+@click.option(
+    "--delete",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Delete Parquet files after uploading to Azure Blob Storage",
+)
+@click.option(
+    "--slack",
+    is_flag=True,
+    show_default=True,
+    default=False,
+    help="Send message to Slack when script exits",
+)
+def main(
+    ws_url, product_ids, path_data, batch_size, price_levels, upload, slack, delete
+):
     """
     Connects to the Coinbase websocket API to receive real-time market data, and writes the top N price level prices and amounts to Parquet files.
 
-    The `--upload` flag enables uploading the Parquet file to Azure Blob Storage and deleting the file after upload. The following environment variables must be set in the local `.env` file: AZURE_URL, AZURE_ACCESS_KEY, and AZURE_BLOB_CONTAINER.
+    The `--upload` flag enables uploading the Parquet file to Azure Blob Storage. The following environment variables must be set in the local `.env` file: AZURE_URL, AZURE_ACCESS_KEY, and AZURE_BLOB_CONTAINER.
 
     The `--slack` flag will send a message to a provided Slack channel when the script is exiting. The following environment variables must be set in the local `.env` file: SLACK_TOKEN, SLACK_CHANNEL.
     """
@@ -247,6 +303,7 @@ def main(ws_url, product_ids, path_data, batch_size, price_levels, upload, slack
             price_levels,
             pa_schema,
             pd_columns,
+            delete,
         )
     )
 

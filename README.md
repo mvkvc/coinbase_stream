@@ -1,3 +1,3 @@
 # coinbase_stream
 
-Receive L2 data from the Coinbase websocket API and upload to Azure Blob Storage.
+Connect to the Coinbase websocket API, record the top `N` price levels and volumes for given pairs, and optionally upload to Azure. See `python src/listen.py --help` for available options.
