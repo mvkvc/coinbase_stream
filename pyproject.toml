@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "cb-stream"
+name = "coinbase-stream"
 version = "0.1.0"
 description = ""
 authors = ["Marko Vukovic <mvkvc.git@gmail.com>"]

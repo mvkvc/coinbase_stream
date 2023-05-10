@@ -8,7 +8,6 @@ import os
 from azure.storage.blob.aio import BlobServiceClient
 import click
 from dotenv import load_dotenv
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from slack_sdk import WebClient
@@ -119,57 +118,61 @@ def reset_batch(price_levels):
 
 
 async def handle_messages(
-    url,
-    container_client,
+    ws_url,
     path_data,
-    subscribe_message,
     batch_size,
     price_levels,
+    retry,
+    delete,
+    container_client,
+    subscribe_message,
     pa_schema,
     pd_columns,
-    delete,
 ):
     side_map = {"buy": "bids", "sell": "asks"}
     order_book = {}
     batch = reset_batch(price_levels)
 
-    async with websockets.connect(url, ping_timeout=None) as websocket:
+    async with websockets.connect(ws_url, ping_timeout=None) as websocket:
         asyncio.create_task(status_message(message_count, batch_count))
         await websocket.send(json.dumps(subscribe_message))
 
-        try:
-            while True:
-                messagestr = await websocket.recv()
-                message = json.loads(messagestr)
+        while True:
+            try:
+                while True:
+                    messagestr = await websocket.recv()
+                    message = json.loads(messagestr)
 
-                if "changes" in message.keys():
-                    message_count[0] += 1
-                    order_book, fmted_message = process_message(
-                        message, order_book, side_map, price_levels
-                    )
+                    if "changes" in message.keys():
+                        message_count[0] += 1
+                        order_book, fmted_message = process_message(
+                            message, order_book, side_map, price_levels
+                        )
 
-                    for b, m in zip(batch, fmted_message):
-                        b.append(m)
+                        for b, m in zip(batch, fmted_message):
+                            b.append(m)
 
-                    # batch.append(fmted_message)
-                    batch_count[0] += 1
+                        # batch.append(fmted_message)
+                        batch_count[0] += 1
 
-                    if batch_count[0] >= batch_size:
-                        fname = get_fname()
-                        write_batch(batch, fname, path_data, pa_schema, pd_columns)
+                        if batch_count[0] >= batch_size:
+                            fname = get_fname()
+                            write_batch(batch, fname, path_data, pa_schema, pd_columns)
 
-                        if container_client:
-                            await upload_batch(container_client, fname, path_data)
-                            if delete:
-                                os.remove(f"{path_data}/{fname}")
+                            if container_client:
+                                await upload_batch(container_client, fname, path_data)
+                                if delete:
+                                    os.remove(f"{path_data}/{fname}")
 
-                        batch = reset_batch(price_levels)
-                        batch_count[0] = 0
-                elif "asks" in message.keys():
-                    print(f"Creating book for: {message['product_id']}")
-                    order_book = create_book(order_book, message)
-        except Exception as e:
-            print(f"Error handling message: {e}")
+                            batch = reset_batch(price_levels)
+                            batch_count[0] = 0
+                    elif "asks" in message.keys():
+                        print(f"Creating book for: {message['product_id']}")
+                        order_book = create_book(order_book, message)
+            except Exception as e:
+                print(f"Error handling message: {e}")
+                print(f"Retrying in {retry} seconds")
+                asyncio.sleep(retry)
 
 
 @click.command()
@@ -177,55 +180,69 @@ async def handle_messages(
     "--ws-url",
     show_default=True,
     default="wss://ws-feed.pro.coinbase.com",
-    help="Websocket URL",
+    help="Feed Websocket URL.",
 )
 @click.option(
     "--product-ids",
     show_default=True,
     default="BTC-USD,ETH-USD,ADA-USD",
-    help="Comma-separated list of product IDs",
+    help="Comma-separated list of product IDs.",
 )
 @click.option(
     "--path-data",
     show_default=True,
     default="data",
-    help="Relative path to write Parquet files",
+    help="Relative path to write Parquet files.",
 )
 @click.option(
     "--batch-size",
     show_default=True,
     default=100_000,
-    help="Number of messages to write to Parquet file before uploading",
+    help="Number of messages to write to Parquet file before uploading.",
 )
 @click.option(
     "--price-levels",
     show_default=True,
     default=20,
-    help="Number of price levels to write to Parquet file",
+    help="Number of price levels to write to Parquet file.",
+)
+@click.option(
+    "--retry",
+    show_default=True,
+    default=3,
+    help="Number of seconds to retry after error.",
 )
 @click.option(
     "--upload",
     is_flag=True,
     show_default=True,
     default=False,
-    help="Upload Parquet files to Azure Blob Storage",
+    help="Upload Parquet files to Azure Blob Storage.",
 )
 @click.option(
     "--delete",
     is_flag=True,
     show_default=True,
     default=False,
-    help="Delete Parquet files after uploading to Azure Blob Storage",
+    help="Delete Parquet files after uploading to Azure Blob Storage.",
 )
 @click.option(
     "--slack",
     is_flag=True,
     show_default=True,
     default=False,
-    help="Send message to Slack when script exits",
+    help="Send message to Slack when script exits.",
 )
 def main(
-    ws_url, product_ids, path_data, batch_size, price_levels, upload, slack, delete
+    ws_url,
+    product_ids,
+    path_data,
+    batch_size,
+    price_levels,
+    retry,
+    upload,
+    delete,
+    slack,
 ):
     """
     Connects to the Coinbase websocket API to receive real-time market data, and writes the top N price level prices and amounts to Parquet files.
@@ -234,6 +251,8 @@ def main(
 
     The `--slack` flag will send a message to a provided Slack channel when the script is exiting. The following environment variables must be set in the local `.env` file: SLACK_TOKEN, SLACK_CHANNEL.
     """
+
+    load_dotenv()
 
     product_ids = product_ids.split(",")
     subscribe_message = {
@@ -260,17 +279,16 @@ def main(
     )
     pa_schema = pa.schema(pa_fields)
 
-    load_dotenv()
-
     container_client = None
     if upload:
         for env_var in ["AZURE_URL", "AZURE_ACCESS_KEY", "AZURE_BLOB_CONTAINER"]:
-            if env_var not in os.environ:
+            val = os.getenv(env_var)
+            if val == "" or val is None:
                 raise ValueError(f"Missing environment variable: {env_var}")
 
-        azure_url = os.environ.get("AZURE_URL")
+        azure_url = os.getenv("AZURE_URL")
         azure_access_key = os.getenv("AZURE_ACCESS_KEY")
-        blob_container = os.environ.get("AZURE_BLOB_CONTAINER")
+        blob_container = os.getenv("AZURE_BLOB_CONTAINER")
 
         path_data = os.path.abspath(path_data)
         blob_service_client = BlobServiceClient(azure_url, credential=azure_access_key)
@@ -278,11 +296,12 @@ def main(
 
     if slack:
         for env_var in ["SLACK_TOKEN", "SLACK_CHANNEL"]:
-            if env_var not in os.environ:
+            val = os.getenv(env_var)
+            if val == "" or val is None:
                 raise ValueError(f"Missing environment variable: {env_var}")
 
-        slack_token = os.environ.get("SLACK_TOKEN")
-        slack_channel = os.environ.get("SLACK_CHANNEL")
+        slack_token = os.getenv("SLACK_TOKEN")
+        slack_channel = os.getenv("SLACK_CHANNEL")
 
         client = WebClient(token=slack_token)
 
@@ -296,17 +315,23 @@ def main(
     asyncio.run(
         handle_messages(
             ws_url,
-            container_client,
             path_data,
-            subscribe_message,
             batch_size,
             price_levels,
+            retry,
+            delete,
+            container_client,
+            subscribe_message,
             pa_schema,
             pd_columns,
-            delete,
         )
     )
 
 
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except Exception as e:
+            print(f"Error occurred: {e}. Restarting...")
+            continue
